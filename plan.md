@@ -60,7 +60,7 @@
 |      캔위성 구조체     |
 |                         |
 |  +-------------------+  |
-|  | Raspberry Pi      |  | <--- MicroSD, IMU 센서 연결
+|  | Raspberry Pi      |  | <--- MicroSD, IMU, LoRa 센서 연결
 |  +-------------------+  |
 |     |             |     |
 |     V             V     |
