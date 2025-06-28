@@ -4,9 +4,7 @@ from scipy.fft import fft, fftshift
 from rtlsdr import RtlSdr
 import os # 파일 경로 및 디렉토리 관리를 위해 os 모듈 임포트
 
-# matplotlib은 SSH 환경에서 바로 그림을 그릴 수 없으므로,
-# 그래프 파일 저장 용도로만 사용하거나, 필요 없으면 주석 처리하여 설치 부담 줄이기
-# import matplotlib.pyplot as plt
+
 
 # --- SDR 설정 ---
 # 21cm 중성수소선 주파수 (Hz)
@@ -22,9 +20,6 @@ NUM_SAMPLES = 2**16 # 65536 샘플 (FFT 해상도 결정)
 NUM_AVERAGES = 100 # 100회 평균 (신호 대 잡음비 향상)
 
 # 데이터 저장 디렉토리 설정
-# 이 경로는 라즈베리파이 SD 카드 내의 특정 폴더를 의미합니다.
-# 직접 생성하거나, 스크립트 실행 시 자동으로 생성하도록 할 수 있습니다.
-# 예: '/home/pi/sdr_data'
 DATA_SAVE_DIR = '/home/pi/sdr_data'
 
 # --- SDR 초기화 ---
@@ -93,8 +88,7 @@ try:
                    delimiter=',', header='Frequency_Hz,Power_dB', comments='')
         print(f"스펙트럼 데이터 '{csv_filename}'에 저장 완료.")
 
-        # 2. (선택 사항) PNG 이미지 파일로 스펙트럼 그래프 저장
-        # matplotlib이 설치되어 있어야 합니다. (SSH 환경에서 plt.show()는 작동 안함)
+        
         try:
             import matplotlib.pyplot as plt
             png_filename = os.path.join(DATA_SAVE_DIR, f"spectrum_plot_{timestamp}.png")
