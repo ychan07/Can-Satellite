@@ -1,0 +1,6 @@
+sudo apt update
+sudo apt install python3-pip -y
+pip3 install lora-driver
+
+
+핀 설정이랑 맞춰야 함 하드웨어 파트는 잘 모르겠어서 패스하고 학교에서 봄

@@ -1,0 +1,27 @@
+
+
+
+sudo apt update
+sudo apt install rtl-sdr librtlsdr-dev -y
+sudo apt install cmake git -y 
+
+
+echo 'blacklist dvb_usb_rtl28xxu' | sudo tee /etc/modprobe.d/blacklist-rtl.conf
+echo 'blacklist rtl2832' | sudo tee -a /etc/modprobe.d/blacklist-rtl.conf
+echo 'blacklist rtl2830' | sudo tee -a /etc/modprobe.d/blacklist-rtl.conf
+sudo depmod -a
+sudo update-initramfs -u
+
+sudo apt install python3-pip -y
+pip3 install pyrtlsdr 
+pip3 install numpy    
+pip3 install scipy   
+pip3 install matplotlib 
+
+
+
+
+
+
+
+캔 위성 라즈베리파이에서 실행할 의존성 설치 목록
