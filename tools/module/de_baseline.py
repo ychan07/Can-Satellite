@@ -8,15 +8,16 @@ def main(file_path=None):
         print("파일 경로를 입력하세요.")
         return
 
-    df = pd.read_csv(file_path)
-    if 'intensity' not in df.columns:
-        print("intensity 열이 없습니다.")
-        return
+    # 공백으로 분리된 데이터 읽기 (헤더 없음)
+    df = pd.read_csv(file_path, delim_whitespace=True, names=['velocity', 'intensity'])
 
     baseline = df['intensity'].mean()
     df['intensity'] = df['intensity'] - baseline
+    
     output = file_path.replace(".csv", "_debaselined.csv")
-    df.to_csv(output, index=False)
+    
+    # 다음 모듈 호환성을 위해 헤더 없이 공백으로 분리하여 저장
+    df.to_csv(output, index=False, header=False, sep=' ')
     print(f"베이스라인 제거 완료: {output}")
 
 if __name__ == "__main__":

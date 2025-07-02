@@ -9,10 +9,8 @@ def main(file_path=None):
         print("파일 경로를 입력하세요.")
         return
 
-    df = pd.read_csv(file_path)
-    if 'velocity' not in df.columns or 'intensity' not in df.columns:
-        print("필수 열이 없습니다 (velocity, intensity)")
-        return
+    # 공백으로 분리된 데이터 읽기 (헤더 없음)
+    df = pd.read_csv(file_path, delim_whitespace=True, names=['velocity', 'intensity'])
 
     df = df.sort_values(by='velocity')
     min_v = df['velocity'].min()
@@ -22,7 +20,9 @@ def main(file_path=None):
 
     new_df = pd.DataFrame({'velocity': new_velocity, 'intensity': new_intensity})
     output = file_path.replace(".csv", "_resampled.csv")
-    new_df.to_csv(output, index=False)
+    
+    # 다음 모듈 호환성을 위해 헤더 없이 공백으로 분리하여 저장
+    new_df.to_csv(output, index=False, header=False, sep=' ')
     print(f"리샘플링 완료: {output}")
 
 if __name__ == "__main__":

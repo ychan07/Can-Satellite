@@ -22,26 +22,28 @@ def select_file():
         file_label.config(text=os.path.basename(file_path))
         messagebox.showinfo("파일 선택됨", f"선택된 파일:\n{file_path}")
 
-def preprocess():
+def preprocess():    
     if not selected_file:
         messagebox.showerror("에러", "먼저 파일을 선택하세요.")
         return
     try:
-        # 1단계: 주파수 → 속도 축 변환
+        # 1단계: MaNGA 파일 정리 (axishifter가 담당)
+        print(f"1단계: {selected_file} 처리 중...")
         ax.main(selected_file)
-        shifted_file = selected_file.replace(".csv", "_shifted.csv")
-
+        vel_file = selected_file.replace(".csv", "_vel.csv")
         # 2단계: 리샘플링
-        res.main(shifted_file)
-        resampled_file = shifted_file.replace(".csv", "_resampled.csv")
-
+        print(f"2단계: {vel_file} 리샘플링 중...")
+        res.main(vel_file)
+        resampled_file = vel_file.replace(".csv", "_resampled.csv")
         # 3단계: 베이스라인 제거
+        print(f"3단계: {resampled_file} 베이스라인 제거 중...")
         db.main(resampled_file)
-        final_file = resampled_file.replace(".csv", "_nobase.csv")
-
+        final_file = resampled_file.replace(".csv", "_debaselined.csv")
         messagebox.showinfo("전처리 완료", f"전처리 결과 파일:\n{final_file}")
+        print(f"전처리 완료. 최종 파일: {final_file}")
     except Exception as e:
         messagebox.showerror("전처리 실패", str(e))
+        print(f"전처리 실패: {e}")
 
 def view_graph():
     if selected_file:

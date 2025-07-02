@@ -10,7 +10,8 @@ def main(file_path=None):
         print("파일 경로가 필요합니다.")
         return
 
-    df = pd.read_csv(file_path)
+    # MaNGA 파일 형식에 맞게 주석(#)을 무시하고, 공백으로 분리된 데이터를 읽음
+    df = pd.read_csv(file_path, comment='#', delim_whitespace=True, names=['velocity', 'intensity', 'pre_baseline_intensity'])
     y = df['intensity'].values
     N = len(y)
     Y = np.abs(np.fft.fft(y - np.mean(y)))
