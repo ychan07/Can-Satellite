@@ -1,214 +1,77 @@
-# lora_receiver.py (지상국용)
+#!/usr/bin/python
+# -*- coding: UTF-8 -*-
 
-import RPi.GPIO as GPIO
-import spidev
-import time
+# 이 스크립트는 UART(시리얼 통신)를 통해 LoRa 모듈을 제어합니다.
+# LoRa 모듈 자체에 펌웨어가 내장되어 있어, 복잡한 LoRa 파라미터(확산 인자, 코딩률 등) 설정 없이
+# UART를 통해 직접 데이터를 송수신할 수 있습니다.
+# 이 코드는 LoRaWAN 프로토콜을 지원하지 않습니다.
+
+# Raspberry Pi 3B+, 4B, Zero 시리즈에서 사용 가능합니다.
+# PC/노트북에서는 GPIO 제어가 불가능하므로, 다른 설정이 필요합니다 (pc_main.py 참조).
+
 import sys
+import sx126x # 제조사에서 제공하는 sx126x 라이브러리 필요
+import time
+import select
+import termios
+import tty
+from threading import Timer # 이 코드에서는 Timer를 직접 사용하지 않지만, 원본 코드에 있었으므로 남겨둠
 
-# LoRa 모듈 핀 설정 (Raspberry Pi 4B/3B/Zero W pinout.xyz 기준)
-# CS_PIN: SPI Chip Select (CE0) - 물리적 핀 24번
-# RST_PIN: Reset 핀 - 물리적 핀 22번 (BCM 25)
-# DIO0_PIN: DIO0 핀 (인터럽트) - 물리적 핀 18번 (BCM 24)
-CS_PIN = 8   # BCM 8 (CE0)
-RST_PIN = 25 # BCM 25
-DIO0_PIN = 24 # BCM 24
+# 터미널 입력 설정을 위한 변수 (수신기에서는 필요 없을 수 있으나, 원본 코드에 있었으므로 남겨둠)
+old_settings = termios.tcgetattr(sys.stdin)
+tty.setcbreak(sys.stdin.fileno())
 
-# SPI 설정 (Raspberry Pi의 기본 SPI 버스 및 장치)
-SPI_BUS = 0
-SPI_DEVICE = 0
-
-# LoRa 레지스터 주소 (SX127x 데이터시트 참조)
-REG_FIFO = 0x00
-REG_OP_MODE = 0x01
-REG_FRF_MSB = 0x06
-REG_FRF_MID = 0x07
-REG_FRF_LSB = 0x08
-REG_PA_CONFIG = 0x09
-REG_LNA = 0x0C
-REG_FIFO_ADDR_PTR = 0x0D
-REG_FIFO_TX_BASE_ADDR = 0x0E
-REG_FIFO_RX_BASE_ADDR = 0x0F
-REG_FIFO_RX_CURRENT_ADDR = 0x10
-REG_IRQ_FLAGS = 0x12
-REG_RX_NB_BYTES = 0x13
-REG_PKT_SNR_VALUE = 0x19
-REG_PKT_RSSI_VALUE = 0x1A
-REG_MODEM_CONFIG1 = 0x1D
-REG_MODEM_CONFIG2 = 0x1E
-REG_SYMB_TIMEOUT_LSB = 0x1F
-REG_PREAMBLE_MSB = 0x20
-REG_PREAMBLE_LSB = 0x21
-REG_PAYLOAD_LENGTH = 0x22
-REG_MAX_PAYLOAD_LENGTH = 0x23
-REG_HOP_PERIOD = 0x24
-REG_DIO_MAPPING1 = 0x40
-REG_VERSION = 0x42
-
-# LoRa 모드
-MODE_LONG_RANGE_MODE = 0x80
-MODE_SLEEP = 0x00
-MODE_STDBY = 0x01
-MODE_TX = 0x03
-MODE_RX_CONTINUOUS = 0x05
-MODE_RX_SINGLE = 0x06
-
-# IRQ 플래그
-IRQ_TX_DONE_MASK = 0x08
-IRQ_PAYLOAD_CRC_ERROR_MASK = 0x20
-IRQ_RX_DONE_MASK = 0x40
-
-# LoRa 클래스 정의 (송신기 코드와 동일)
-class LoRa:
-    def __init__(self, spi_bus, spi_device, cs_pin, rst_pin, dio0_pin):
-        self.cs_pin = cs_pin
-        self.rst_pin = rst_pin
-        self.dio0_pin = dio0_pin
-
-        # GPIO 설정
-        GPIO.setmode(GPIO.BCM) # BCM 핀 번호 모드 사용
-        GPIO.setup(self.cs_pin, GPIO.OUT)
-        GPIO.setup(self.rst_pin, GPIO.OUT)
-        GPIO.setup(self.dio0_pin, GPIO.IN, pull_up_down=GPIO.PUD_DOWN) # DIO0을 입력으로 설정
-
-        # SPI 초기화
-        self.spi = spidev.SpiDev()
-        self.spi.open(spi_bus, spi_device)
-        self.spi.max_speed_hz = 1000000 # 1MHz
-
-        # LoRa 모듈 리셋
-        GPIO.output(self.rst_pin, GPIO.LOW)
-        time.sleep(0.01)
-        GPIO.output(self.rst_pin, GPIO.HIGH)
-        time.sleep(0.01)
-
-        print("LoRa 모듈 초기화 중...")
-        self.init_lora()
-
-    def write_reg(self, address, value):
-        GPIO.output(self.cs_pin, GPIO.LOW)
-        self.spi.xfer2([address | 0x80, value]) # Write bit set (MSB)
-        GPIO.output(self.cs_pin, GPIO.HIGH)
-
-    def read_reg(self, address):
-        GPIO.output(self.cs_pin, GPIO.LOW)
-        response = self.spi.xfer2([address & 0x7F, 0x00]) # Read bit cleared (MSB)
-        GPIO.output(self.cs_pin, GPIO.HIGH)
-        return response[1]
-
-    def set_mode(self, mode):
-        self.write_reg(REG_OP_MODE, mode)
-        # print(f"모드 설정: {mode:02x}, 현재 모드: {self.read_reg(REG_OP_MODE):02x}")
-        time.sleep(0.01) # 모드 변경 후 안정화 시간
-
-    def init_lora(self):
-        # LoRa 모드 (Long Range Mode) 활성화 및 Sleep 모드 진입
-        self.set_mode(MODE_SLEEP | MODE_LONG_RANGE_MODE)
-
-        # 주파수 설정 (예: 433MHz) - 송신기와 동일하게 설정
-        frf = int(433.0e6 / (32.0e6 / 524288.0))
-        self.write_reg(REG_FRF_MSB, (frf >> 16) & 0xFF)
-        self.write_reg(REG_FRF_MID, (frf >> 8) & 0xFF)
-        self.write_reg(REG_FRF_LSB, frf & 0xFF)
-
-        # PA_BOOST 활성화 (고출력)
-        self.write_reg(REG_PA_CONFIG, 0xFF) # Max power
-
-        # LNA (Low Noise Amplifier) 설정
-        self.write_reg(REG_LNA, 0x23) # LNA gain set to G1, LNA boost enabled
-
-        # 모뎀 설정 1 (BW, Coding Rate, Implicit Header Mode) - 송신기와 동일하게 설정
-        self.write_reg(REG_MODEM_CONFIG1, 0x72) # BW 125kHz, CR 4/5, Explicit Header
-
-        # 모뎀 설정 2 (Spreading Factor, TX Continuous Mode, CRC Enable) - 송신기와 동일하게 설정
-        self.write_reg(REG_MODEM_CONFIG2, 0x74) # SF7, CRC On
-
-        # 심볼 타임아웃 설정
-        self.write_reg(REG_SYMB_TIMEOUT_LSB, 0x64) # 100 symbols
-
-        # 프리앰블 길이 설정 (Preamble Length)
-        self.write_reg(REG_PREAMBLE_MSB, 0x00)
-        self.write_reg(REG_PREAMBLE_LSB, 0x08) # 8 symbols
-
-        # FIFO TX Base Address 설정
-        self.write_reg(REG_FIFO_TX_BASE_ADDR, 0x00)
-        self.write_reg(REG_FIFO_RX_BASE_ADDR, 0x00)
-
-        # DIO0 맵핑 (RxDone 인터럽트)
-        self.write_reg(REG_DIO_MAPPING1, 0x00) # DIO0 -> RxDone (0x00 for RxDone, 0x01 for TxDone, etc.)
-
-        # RxContinuous 모드로 전환
-        self.set_mode(MODE_RX_CONTINUOUS)
-        print("LoRa 모듈 초기화 완료. 수신 대기 중...")
-
-    def receive_packet(self):
-        # RxDone 인터럽트 대기
-        # DIO0 핀이 HIGH가 될 때까지 기다립니다.
-        start_time = time.time()
-        while not GPIO.input(self.dio0_pin):
-            if time.time() - start_time > 10: # 10초 타임아웃
-                # print("RX Done 대기 중 타임아웃 발생. 재시도.")
-                self.set_mode(MODE_RX_CONTINUOUS) # 다시 수신 모드로
-                return None, None, None # 수신 실패 시 None 반환
-            time.sleep(0.001)
-
-        # IRQ 플래그 읽기 및 초기화
-        irq_flags = self.read_reg(REG_IRQ_FLAGS)
-        self.write_reg(REG_IRQ_FLAGS, irq_flags) # 플래그 초기화
-
-        if (irq_flags & IRQ_RX_DONE_MASK) and not (irq_flags & IRQ_PAYLOAD_CRC_ERROR_MASK):
-            # 패킷 수신 완료 및 CRC 오류 없음
-            # FIFO RX Current Address로 이동
-            current_fifo_address = self.read_reg(REG_FIFO_RX_CURRENT_ADDR)
-            self.write_reg(REG_FIFO_ADDR_PTR, current_fifo_address)
-
-            # 수신된 바이트 수
-            num_bytes = self.read_reg(REG_RX_NB_BYTES)
-            
-            # FIFO에서 데이터 읽기
-            payload = []
-            for _ in range(num_bytes):
-                payload.append(self.read_reg(REG_FIFO))
-            
-            # RSSI 및 SNR 값 읽기
-            rssi = self.read_reg(REG_PKT_RSSI_VALUE) - 157 # SX127x datasheet formula
-            snr = self.read_reg(REG_PKT_SNR_VALUE) / 4.0 # SX127x datasheet formula
-
-            # 다시 수신 모드로 전환
-            self.set_mode(MODE_RX_CONTINUOUS)
-            return bytes(payload), rssi, snr
-        else:
-            if (irq_flags & IRQ_PAYLOAD_CRC_ERROR_MASK):
-                print("CRC 오류 발생. 패킷 손상.")
-            # 다시 수신 모드로 전환
-            self.set_mode(MODE_RX_CONTINUOUS)
-            return None, None, None # 수신 실패 시 None 반환
-
-    def cleanup(self):
-        self.spi.close()
-        GPIO.cleanup()
-        print("GPIO 및 SPI 정리 완료.")
-
-# 메인 실행 부분
-if __name__ == "__main__":
-    lora = None
+# Raspberry Pi CPU 온도 가져오기 함수 (수신기에서는 필요 없을 수 있으나, 원본 코드에 있었으므로 남겨둠)
+def get_cpu_temp():
     try:
-        lora = LoRa(SPI_BUS, SPI_DEVICE, CS_PIN, RST_PIN, DIO0_PIN)
-        
-        while True:
-            payload, rssi, snr = lora.receive_packet()
-            if payload:
-                try:
-                    message = payload.decode('utf-8')
-                    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 수신: '{message}' (RSSI: {rssi:.2f} dBm, SNR: {snr:.2f} dB)")
-                except UnicodeDecodeError:
-                    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 수신 (디코딩 실패): {payload.hex()} (RSSI: {rssi:.2f} dBm, SNR: {snr:.2f} dB)")
-            time.sleep(0.1) # 짧은 대기 시간
+        with open("/sys/class/thermal/thermal_zone0/temp", "r") as tempFile:
+            cpu_temp = tempFile.read()
+        return float(cpu_temp) / 1000
+    except FileNotFoundError:
+        return 0.0
 
-    except KeyboardInterrupt:
-        print("\n프로그램 종료 요청.")
-    except Exception as e:
-        print(f"오류 발생: {e}")
-    finally:
-        if lora:
-            lora.cleanup()
+# --- LoRa 모듈 초기화 ---
+# serial_num: Raspberry Pi Zero, Pi3B+, Pi4B는 일반적으로 "/dev/ttyS0" 사용
+# freq: 주파수 (410 ~ 493MHz 또는 850 ~ 930MHz 범위)
+# addr: 모듈 주소 (0 ~ 65535). 동일 주파수에서 통신하려면 주소가 같아야 합니다.
+#       단, 65535 주소는 브로드캐스트 주소로, 다른 모든 주소(0~65534)의 메시지를 수신할 수 있습니다.
+# power: 전송 출력 ({10, 13, 17, 22} dBm 중 선택) - 수신기에서는 전송을 하지 않으므로 중요하지 않음
+# rssi: 수신 시 RSSI 값 출력 여부 (True 또는 False)
+# air_speed: 공중 전송 속도 (bps). 송수신기 동일해야 함. (예: 2400bps)
+# relay: 릴레이 기능 활성화 여부 (True 또는 False)
+#
+# 주의: M0, M1 점퍼는 제거된 상태(HIGH)여야 합니다. (제조사 권장)
+
+# 지상국(수신기) 설정 예시
+# 캔위성(송신기)과 동일한 주파수와 air_speed를 사용해야 합니다.
+# 수신기는 모든 주소의 메시지를 받기 위해 addr=65535 (브로드캐스트)로 설정하거나,
+# 송신기와 동일한 주소(addr=0)로 설정할 수 있습니다. 여기서는 캔위성과 동일하게 433MHz, addr=0으로 설정합니다.
+node = sx126x.sx126x(serial_num="/dev/ttyS0", freq=433, addr=0, power=22, rssi=True, air_speed=2400, relay=False)
+
+# --- 메인 루프 ---
+try:
+    time.sleep(1) # 모듈 초기화 대기
+    print("--------------------------------------------------")
+    print("LoRa 수신기 모드 시작. 메시지 수신 대기 중...")
+    print("종료하려면 Ctrl+C를 누르세요.")
+    print("--------------------------------------------------")
+    
+    while True:
+        # LoRa 모듈로부터 메시지 수신
+        # sx126x 라이브러리의 receive() 함수가 메시지를 수신하고 처리합니다.
+        # 이 함수는 수신된 메시지를 내부적으로 처리하고,
+        # RSSI가 True로 설정되어 있으면 RSSI 값을 함께 출력합니다.
+        node.receive() 
+        
+        # CPU 사용률을 줄이기 위해 짧은 대기
+        time.sleep(0.1) 
+
+except KeyboardInterrupt:
+    print("\n프로그램 종료 요청.")
+except Exception as e:
+    print(f"\n예상치 못한 오류 발생: {e}")
+finally:
+    # 프로그램 종료 시 터미널 설정 복구
+    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+    print("\n프로그램이 종료되었습니다.")
 

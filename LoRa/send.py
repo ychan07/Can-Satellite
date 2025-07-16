@@ -1,206 +1,169 @@
-# lora_sender.py (캔위성용)
+#!/usr/bin/python
+# -*- coding: UTF-8 -*-
 
-import RPi.GPIO as GPIO
-import spidev
-import time
+# 이 스크립트는 UART(시리얼 통신)를 통해 LoRa 모듈을 제어합니다.
+# LoRa 모듈 자체에 펌웨어가 내장되어 있어, 복잡한 LoRa 파라미터(확산 인자, 코딩률 등) 설정 없이
+# UART를 통해 직접 데이터를 송수신할 수 있습니다.
+# 이 코드는 LoRaWAN 프로토콜을 지원하지 않습니다.
+
+# Raspberry Pi 3B+, 4B, Zero 시리즈에서 ㅁ사용 가능합니다.
+
 import sys
+import sx126x  # 제조사에서 제공하는 sx126x 라이브러리 필요
+import time
+import select
+import termios
+import tty
+# from threading import Timer # CPU 온도 전송 기능 제거로 Timer는 더 이상 필요 없음
 
-# LoRa 모듈 핀 설정 (Raspberry Pi 4B/3B/Zero W pinout.xyz 기준)
-# CS_PIN: SPI Chip Select (CE0) - 물리적 핀 24번
-# RST_PIN: Reset 핀 - 물리적 핀 22번 (BCM 25)
-# DIO0_PIN: DIO0 핀 (인터럽트) - 물리적 핀 18번 (BCM 24)
-CS_PIN = 8   # BCM 8 (CE0)
-RST_PIN = 25 # BCM 25
-DIO0_PIN = 24 # BCM 24
+# 터미널 입력 설정을 위한 변수 (논블로킹 문자 입력 처리용)
+old_settings = termios.tcgetattr(sys.stdin)
+tty.setcbreak(sys.stdin.fileno())
 
-# SPI 설정 (Raspberry Pi의 기본 SPI 버스 및 장치)
-SPI_BUS = 0
-SPI_DEVICE = 0
+# --- LoRa 모듈 초기화 ---
+# serial_num: Raspberry Pi Zero, Pi3B+, Pi4B는 일반적으로 "/dev/ttyS0" 사용
+# freq: 주파수 (410 ~ 493MHz 또는 850 ~ 930MHz 범위)
+# addr: 모듈 주소 (0 ~ 65535). 동일 주파수에서 통신하려면 주소가 같아야 합니다.
+#       단, 65535 주소는 브로드캐스트 주소로, 다른 모든 주소(0~65534)의 메시지를 수신할 수 있습니다.
+# power: 전송 출력 ({10, 13, 17, 22} dBm 중 선택)
+# rssi: 수신 시 RSSI 값 출력 여부 (True 또는 False)
+# air_speed: 공중 전송 속도 (bps). 송수신기 동일해야 함. (예: 2400bps)
+# relay: 릴레이 기능 활성화 여부 (True 또는 False)
+#
+# 주의: M0, M1 점퍼는 제거된 상태(HIGH)여야 합니다. (제조사 권장)
 
-# LoRa 레지스터 주소 (SX127x 데이터시트 참조)
-REG_FIFO = 0x00
-REG_OP_MODE = 0x01
-REG_FRF_MSB = 0x06
-REG_FRF_MID = 0x07
-REG_FRF_LSB = 0x08
-REG_PA_CONFIG = 0x09
-REG_LNA = 0x0C
-REG_FIFO_ADDR_PTR = 0x0D
-REG_FIFO_TX_BASE_ADDR = 0x0E
-REG_FIFO_RX_BASE_ADDR = 0x0F
-REG_FIFO_RX_CURRENT_ADDR = 0x10
-REG_IRQ_FLAGS = 0x12
-REG_RX_NB_BYTES = 0x13
-REG_PKT_SNR_VALUE = 0x19
-REG_PKT_RSSI_VALUE = 0x1A
-REG_MODEM_CONFIG1 = 0x1D
-REG_MODEM_CONFIG2 = 0x1E
-REG_SYMB_TIMEOUT_LSB = 0x1F
-REG_PREAMBLE_MSB = 0x20
-REG_PREAMBLE_LSB = 0x21
-REG_PAYLOAD_LENGTH = 0x22
-REG_MAX_PAYLOAD_LENGTH = 0x23
-REG_HOP_PERIOD = 0x24
-REG_DIO_MAPPING1 = 0x40
-REG_VERSION = 0x42
+# 캔위성(송신기) 설정 예시
+# 지상국과 동일한 주파수와 air_speed를 사용해야 합니다.
+node = sx126x.sx126x(serial_num="/dev/ttyS0", freq=433, addr=0, power=22, rssi=True, air_speed=2400, relay=False)
 
-# LoRa 모드
-MODE_LONG_RANGE_MODE = 0x80
-MODE_SLEEP = 0x00
-MODE_STDBY = 0x01
-MODE_TX = 0x03
-MODE_RX_CONTINUOUS = 0x05
-MODE_RX_SINGLE = 0x06
+# --- 메시지 연속 전송 처리 함수 ---
+def send_messages_continuously(fixed_target_address, fixed_target_frequency):
+    print("\n--- 연속 메시지 전송 모드 ---")
+    print(f"대상: 주소 {fixed_target_address}, 주파수 {fixed_target_frequency}MHz")
+    print("메시지를 입력하고 Enter를 누르세요. 종료하려면 'exit' 입력 후 Enter 또는 Esc 키.")
 
-# IRQ 플래그
-IRQ_TX_DONE_MASK = 0x08
-IRQ_PAYLOAD_CRC_ERROR_MASK = 0x20
-IRQ_RX_DONE_MASK = 0x40
-
-# LoRa 클래스 정의
-class LoRa:
-    def __init__(self, spi_bus, spi_device, cs_pin, rst_pin, dio0_pin):
-        self.cs_pin = cs_pin
-        self.rst_pin = rst_pin
-        self.dio0_pin = dio0_pin
-
-        # GPIO 설정
-        GPIO.setmode(GPIO.BCM) # BCM 핀 번호 모드 사용
-        GPIO.setup(self.cs_pin, GPIO.OUT)
-        GPIO.setup(self.rst_pin, GPIO.OUT)
-        GPIO.setup(self.dio0_pin, GPIO.IN, pull_up_down=GPIO.PUD_DOWN) # DIO0을 입력으로 설정
-
-        # SPI 초기화
-        self.spi = spidev.SpiDev()
-        self.spi.open(spi_bus, spi_device)
-        self.spi.max_speed_hz = 1000000 # 1MHz
-
-        # LoRa 모듈 리셋
-        GPIO.output(self.rst_pin, GPIO.LOW)
-        time.sleep(0.01)
-        GPIO.output(self.rst_pin, GPIO.HIGH)
-        time.sleep(0.01)
-
-        print("LoRa 모듈 초기화 중...")
-        self.init_lora()
-
-    def write_reg(self, address, value):
-        GPIO.output(self.cs_pin, GPIO.LOW)
-        self.spi.xfer2([address | 0x80, value]) # Write bit set (MSB)
-        GPIO.output(self.cs_pin, GPIO.HIGH)
-
-    def read_reg(self, address):
-        GPIO.output(self.cs_pin, GPIO.LOW)
-        response = self.spi.xfer2([address & 0x7F, 0x00]) # Read bit cleared (MSB)
-        GPIO.output(self.cs_pin, GPIO.HIGH)
-        return response[1]
-
-    def set_mode(self, mode):
-        self.write_reg(REG_OP_MODE, mode)
-        # print(f"모드 설정: {mode:02x}, 현재 모드: {self.read_reg(REG_OP_MODE):02x}")
-        time.sleep(0.01) # 모드 변경 후 안정화 시간
-
-    def init_lora(self):
-        # LoRa 모드 (Long Range Mode) 활성화 및 Sleep 모드 진입
-        self.set_mode(MODE_SLEEP | MODE_LONG_RANGE_MODE)
-
-        # 주파수 설정 (예: 433MHz)
-        # F_RF = F_OSC * FRF / 2^19
-        # 433MHz = 32MHz * FRF / 524288
-        # FRF = 433e6 * 524288 / 32e6 = 7076736 (0x6C8000)
-        frf = int(433.0e6 / (32.0e6 / 524288.0))
-        self.write_reg(REG_FRF_MSB, (frf >> 16) & 0xFF)
-        self.write_reg(REG_FRF_MID, (frf >> 8) & 0xFF)
-        self.write_reg(REG_FRF_LSB, frf & 0xFF)
-
-        # PA_BOOST 활성화 (고출력)
-        self.write_reg(REG_PA_CONFIG, 0xFF) # Max power
-
-        # LNA (Low Noise Amplifier) 설정
-        self.write_reg(REG_LNA, 0x23) # LNA gain set to G1, LNA boost enabled
-
-        # 모뎀 설정 1 (BW, Coding Rate, Implicit Header Mode)
-        # BW: 125kHz (0x70), CR: 4/5 (0x02), Explicit Header Off (0x00) -> 0x72
-        self.write_reg(REG_MODEM_CONFIG1, 0x72) # BW 125kHz, CR 4/5, Explicit Header
-
-        # 모뎀 설정 2 (Spreading Factor, TX Continuous Mode, CRC Enable)
-        # SF: 7 (0x70), TX Continuous Off (0x00), CRC On (0x04) -> 0x74
-        self.write_reg(REG_MODEM_CONFIG2, 0x74) # SF7, CRC On
-
-        # 심볼 타임아웃 설정
-        self.write_reg(REG_SYMB_TIMEOUT_LSB, 0x64) # 100 symbols
-
-        # 프리앰블 길이 설정 (Preamble Length)
-        self.write_reg(REG_PREAMBLE_MSB, 0x00)
-        self.write_reg(REG_PREAMBLE_LSB, 0x08) # 8 symbols
-
-        # FIFO TX Base Address 설정
-        self.write_reg(REG_FIFO_TX_BASE_ADDR, 0x00)
-        self.write_reg(REG_FIFO_RX_BASE_ADDR, 0x00)
-
-        # DIO0 맵핑 (TxDone 인터럽트)
-        self.write_reg(REG_DIO_MAPPING1, 0x00) # DIO0 -> TxDone
-
-        # Standby 모드로 전환
-        self.set_mode(MODE_STDBY)
-        print("LoRa 모듈 초기화 완료.")
-
-    def send_packet(self, data):
-        self.set_mode(MODE_STDBY) # Standby 모드로 전환
-        self.write_reg(REG_FIFO_ADDR_PTR, 0x00) # FIFO 포인터 초기화
-
-        # FIFO에 데이터 쓰기
-        for byte in data:
-            self.write_reg(REG_FIFO, byte)
-
-        self.write_reg(REG_PAYLOAD_LENGTH, len(data)) # 페이로드 길이 설정
-
-        # TX 모드로 전환하여 전송 시작
-        self.set_mode(MODE_TX)
-
-        # TxDone 인터럽트 대기
-        # DIO0 핀이 HIGH가 될 때까지 기다립니다.
-        start_time = time.time()
-        while not GPIO.input(self.dio0_pin):
-            if time.time() - start_time > 5: # 5초 타임아웃
-                print("TX Done 대기 중 타임아웃 발생.")
-                break
-            time.sleep(0.001)
-
-        # IRQ 플래그 읽기 및 초기화
-        irq_flags = self.read_reg(REG_IRQ_FLAGS)
-        self.write_reg(REG_IRQ_FLAGS, irq_flags) # 플래그 초기화
-
-        if (irq_flags & IRQ_TX_DONE_MASK):
-            print(f"패킷 전송 완료: {data.decode('utf-8')}")
-        else:
-            print("패킷 전송 실패 또는 TxDone IRQ 발생 안함.")
-
-        self.set_mode(MODE_STDBY) # 전송 후 Standby 모드로 복귀
-
-    def cleanup(self):
-        self.spi.close()
-        GPIO.cleanup()
-        print("GPIO 및 SPI 정리 완료.")
-
-# 메인 실행 부분
-if __name__ == "__main__":
-    lora = None
-    try:
-        lora = LoRa(SPI_BUS, SPI_DEVICE, CS_PIN, RST_PIN, DIO0_PIN)
+    while True:
+        sys.stdout.write("메시지 입력: ")
+        sys.stdout.flush()
         
-        packet_count = 0
+        get_rec = ""
+        # 문자 하나씩 읽어서 입력 받기 (Enter 또는 Esc까지)
         while True:
-            message = f"Hello from CanSat! Packet: {packet_count}"
-            lora.send_packet(message.encode('utf-8'))
-            packet_count += 1
-            time.sleep(5) # 5초마다 전송
+            char = sys.stdin.read(1) # 문자 하나를 읽을 때까지 블록킹
+            if char == '\x0a': # Enter 키 (줄바꿈)
+                break
+            if char == '\x1b': # Esc 키
+                print("\n연속 전송 모드 종료.")
+                return # 함수 종료 (메인 루프로 돌아감)
+            
+            get_rec += char
+            sys.stdout.write(char) # 입력된 문자 터미널에 에코
+            sys.stdout.flush()
 
-    except KeyboardInterrupt:
-        print("\n프로그램 종료 요청.")
-    except Exception as e:
-        print(f"오류 발생: {e}")
-    finally:
-        if lora:
-            lora.cleanup()
+        if get_rec.lower() == "exit":
+            print("\n연속 전송 모드 종료.")
+            break
+
+        message_payload = get_rec
+
+        # 주파수 오프셋 계산 (모듈 내부 계산 방식에 따름)
+        # 850MHz 이상이면 850을 기준으로, 아니면 410을 기준으로 오프셋 계산
+        offset_frequence = fixed_target_frequency - (850 if fixed_target_frequency > 850 else 410)
+
+        # 전송 메시지 형식 (제조사 라이브러리 규격에 따름)
+        # [수신 노드 고위 8비트 주소] + [수신 노드 저위 8비트 주소] + [수신 노드 주파수 오프셋] +
+        # [자신 노드 고위 8비트 주소] + [자신 노드 저위 8비트 주소] + [자신 노드 주파수 오프셋] + 메시지 페이로드
+        data = (
+            bytes([fixed_target_address >> 8]) + bytes([fixed_target_address & 0xff]) +
+            bytes([offset_frequence]) +
+            bytes([node.addr >> 8]) + bytes([node.addr & 0xff]) +
+            bytes([node.offset_freq]) +
+            message_payload.encode()
+        )
+
+        node.send(data) # LoRa 모듈로 데이터 전송
+        print(f"\n메시지 전송 완료: '{message_payload}'")
+        # 다음 입력을 위해 이전 입력 줄을 지울 필요 없이 새로운 프롬프트가 덮어씀
+
+# --- 메인 루프 ---
+try:
+    time.sleep(1) # 모듈 초기화 대기
+    print("--------------------------------------------------")
+    print("Press \033[1;32mEsc\033[0m to exit the program")
+    print("Press \033[1;32mi\033[0m   to start sending custom messages")
+    print("--------------------------------------------------")
+    
+    while True:
+        # 키보드 입력 감지 (논블로킹)
+        if select.select([sys.stdin], [], [], 0) == ([sys.stdin], [], []):
+            c = sys.stdin.read(1) # 단일 문자 읽기
+
+            # Esc 키 감지 (프로그램 종료)
+            if c == '\x1b':
+                break
+            
+            # 'i' 키 감지 (메시지 전송 모드 시작)
+            if c == '\x69':
+                print("\n")
+                print("첫 메시지 전송을 위한 '대상주소,대상주파수,메시지' 형식으로 입력하세요.")
+                print("예: \033[1;32m0,433,Hello World\033[0m")
+                sys.stdout.write("입력 후 Enter 키를 누르세요: ")
+                sys.stdout.flush()
+
+                initial_input = ""
+                # 첫 입력 받기 (Enter까지 블록킹)
+                while True:
+                    char = sys.stdin.read(1)
+                    if char == '\x0a': # Enter
+                        break
+                    initial_input += char
+                    sys.stdout.write(char)
+                    sys.stdout.flush()
+
+                try:
+                    parts = initial_input.split(",")
+                    if len(parts) != 3:
+                        print("\n잘못된 입력 형식입니다. '주소,주파수,메시지' 형식으로 입력하세요.")
+                        # 입력 줄을 지우고 커서를 원래 위치로 돌려보내기 (선택 사항)
+                        sys.stdout.write('\x1b[1A\r' + ' ' * 100 + '\r\x1b[1A')
+                        sys.stdout.flush()
+                        continue # 메인 루프로 돌아가 다시 입력 대기
+                    
+                    fixed_target_address = int(parts[0])
+                    fixed_target_frequency = int(parts[1])
+                    first_message_payload = parts[2]
+
+                    # 첫 메시지 전송
+                    offset_frequence = fixed_target_frequency - (850 if fixed_target_frequency > 850 else 410)
+                    data = (
+                        bytes([fixed_target_address >> 8]) + bytes([fixed_target_address & 0xff]) +
+                        bytes([offset_frequence]) +
+                        bytes([node.addr >> 8]) + bytes([node.addr & 0xff]) +
+                        bytes([node.offset_freq]) +
+                        first_message_payload.encode()
+                    )
+                    node.send(data)
+                    print(f"\n첫 메시지 전송 완료: '{first_message_payload}' (대상: 주소 {fixed_target_address}, 주파수 {fixed_target_frequency}MHz)")
+
+                    # 연속 전송 모드 진입
+                    send_messages_continuously(fixed_target_address, fixed_target_frequency)
+
+                except ValueError:
+                    print("\n입력 값이 올바르지 않습니다. 주소, 주파수는 숫자로 입력하세요.")
+                except Exception as e:
+                    print(f"\n메시지 전송 중 오류 발생: {e}")
+
+            sys.stdout.flush() # 키 입력 처리 후 버퍼 비우기
+            
+        node.receive() # 키보드 입력이 없을 때도 LoRa 메시지 수신 대기
+        
+        time.sleep(0.1) # CPU 사용률을 줄이기 위한 짧은 대기
+
+except Exception as e:
+    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+    print(f"\n예상치 못한 오류 발생: {e}")
+finally:
+    # 프로그램 종료 시 터미널 설정 복구
+    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+    print("\n프로그램이 종료되었습니다.")
 
