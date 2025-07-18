@@ -6,7 +6,11 @@
 # UART를 통해 직접 데이터를 송수신할 수 있습니다.
 # 이 코드는 LoRaWAN 프로토콜을 지원하지 않습니다.
 
+<<<<<<< HEAD
 # Raspberry Pi 3B+, 4B, Zero 시리즈에서 사용 가능합니다.
+=======
+# Raspberry Pi 3B+, 4B, Zero 시리즈에서 ㅁ사용 가능합니다.
+>>>>>>> a4d54c02ae7d8760bbf8bfaa488406fff722495e
 
 import sys
 import sx126x  # 제조사에서 제공하는 sx126x 라이브러리 필요
@@ -20,6 +24,7 @@ import tty
 old_settings = termios.tcgetattr(sys.stdin)
 tty.setcbreak(sys.stdin.fileno())
 
+<<<<<<< HEAD
 
 # --- LoRa 모듈 초기화 ---
 # serial_num: Raspberry Pi Zero, Pi3B+, Pi4B는 일반적으로 "/dev/ttyS0" 사용
@@ -75,6 +80,54 @@ def send_messages_continuously(fixed_target_address, fixed_target_frequency):
 
         message_payload = get_rec
 
+=======
+# --- LoRa 모듈 초기화 ---
+# serial_num: Raspberry Pi Zero, Pi3B+, Pi4B는 일반적으로 "/dev/ttyS0" 사용
+# freq: 주파수 (410 ~ 493MHz 또는 850 ~ 930MHz 범위)
+# addr: 모듈 주소 (0 ~ 65535). 동일 주파수에서 통신하려면 주소가 같아야 합니다.
+#       단, 65535 주소는 브로드캐스트 주소로, 다른 모든 주소(0~65534)의 메시지를 수신할 수 있습니다.
+# power: 전송 출력 ({10, 13, 17, 22} dBm 중 선택)
+# rssi: 수신 시 RSSI 값 출력 여부 (True 또는 False)
+# air_speed: 공중 전송 속도 (bps). 송수신기 동일해야 함. (예: 2400bps)
+# relay: 릴레이 기능 활성화 여부 (True 또는 False)
+#
+# 주의: M0, M1 점퍼는 제거된 상태(HIGH)여야 합니다. (제조사 권장)
+
+# 캔위성(송신기) 설정 예시
+# 지상국과 동일한 주파수와 air_speed를 사용해야 합니다.
+node = sx126x.sx126x(serial_num="/dev/ttyS0", freq=433, addr=0, power=22, rssi=True, air_speed=2400, relay=False)
+
+# --- 메시지 연속 전송 처리 함수 ---
+def send_messages_continuously(fixed_target_address, fixed_target_frequency):
+    print("\n--- 연속 메시지 전송 모드 ---")
+    print(f"대상: 주소 {fixed_target_address}, 주파수 {fixed_target_frequency}MHz")
+    print("메시지를 입력하고 Enter를 누르세요. 종료하려면 'exit' 입력 후 Enter 또는 Esc 키.")
+
+    while True:
+        sys.stdout.write("메시지 입력: ")
+        sys.stdout.flush()
+        
+        get_rec = ""
+        # 문자 하나씩 읽어서 입력 받기 (Enter 또는 Esc까지)
+        while True:
+            char = sys.stdin.read(1) # 문자 하나를 읽을 때까지 블록킹
+            if char == '\x0a': # Enter 키 (줄바꿈)
+                break
+            if char == '\x1b': # Esc 키
+                print("\n연속 전송 모드 종료.")
+                return # 함수 종료 (메인 루프로 돌아감)
+            
+            get_rec += char
+            sys.stdout.write(char) # 입력된 문자 터미널에 에코
+            sys.stdout.flush()
+
+        if get_rec.lower() == "exit":
+            print("\n연속 전송 모드 종료.")
+            break
+
+        message_payload = get_rec
+
+>>>>>>> a4d54c02ae7d8760bbf8bfaa488406fff722495e
         # 주파수 오프셋 계산 (모듈 내부 계산 방식에 따름)
         # 850MHz 이상이면 850을 기준으로, 아니면 410을 기준으로 오프셋 계산
         offset_frequence = fixed_target_frequency - (850 if fixed_target_frequency > 850 else 410)
@@ -125,6 +178,7 @@ try:
                     char = sys.stdin.read(1)
                     if char == '\x0a': # Enter
                         break
+<<<<<<< HEAD
                     
                     # 백스페이스 처리 (ASCII DEL: \x7f, Backspace: \x08)
                     if char == '\x7f' or char == '\x08':
@@ -136,6 +190,11 @@ try:
                         initial_input += char
                         sys.stdout.write(char)
                         sys.stdout.flush()
+=======
+                    initial_input += char
+                    sys.stdout.write(char)
+                    sys.stdout.flush()
+>>>>>>> a4d54c02ae7d8760bbf8bfaa488406fff722495e
 
                 try:
                     parts = initial_input.split(",")

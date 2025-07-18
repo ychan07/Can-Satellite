@@ -1,107 +1,77 @@
+#!/usr/bin/python
+# -*- coding: UTF-8 -*-
+
+# 이 스크립트는 UART(시리얼 통신)를 통해 LoRa 모듈을 제어합니다.
+# LoRa 모듈 자체에 펌웨어가 내장되어 있어, 복잡한 LoRa 파라미터(확산 인자, 코딩률 등) 설정 없이
+# UART를 통해 직접 데이터를 송수신할 수 있습니다.
+# 이 코드는 LoRaWAN 프로토콜을 지원하지 않습니다.
+
+# Raspberry Pi 3B+, 4B, Zero 시리즈에서 사용 가능합니다.
+# PC/노트북에서는 GPIO 제어가 불가능하므로, 다른 설정이 필요합니다 (pc_main.py 참조).
+
+import sys
+import sx126x # 제조사에서 제공하는 sx126x 라이브러리 필요
 import time
-import spidev
-import RPi.GPIO as GPIO
-from lora_driver import SX127x
+import select
+import termios
+import tty
+from threading import Timer # 이 코드에서는 Timer를 직접 사용하지 않지만, 원본 코드에 있었으므로 남겨둠
 
-# --- LoRa 모듈 설정 ---
-# 사용하는 모듈의 핀 연결에 맞게 BCM 핀 번호 수정
-CS_PIN = 8      # Chip Select (CE0)
-DIO0_PIN = 24   # DIO0 (Interrupt Request)
-RST_PIN = 25    # Reset Pin (옵션, 모듈에 RST 핀이 없다면 RST_PIN = None 으로 설정하거나 해당 라인 주석 처리)
+# 터미널 입력 설정을 위한 변수 (수신기에서는 필요 없을 수 있으나, 원본 코드에 있었으므로 남겨둠)
+old_settings = termios.tcgetattr(sys.stdin)
+tty.setcbreak(sys.stdin.fileno())
 
-# SPI 버스 및 디바이스 설정 (일반적으로 SPI 버스 0, 디바이스 0)
-SPI_BUS = 0
-SPI_DEVICE = 0
-
-# LoRa 주파수 설정 (MHz) - 송신기와 동일하게 설정!
-LORA_FREQUENCY = 920.0
-
-# --- LoRa 파라미터 설정 ---
-# 송신기와 동일하게 설정해야 합니다!
-SPREADING_FACTOR = 7
-BANDWIDTH = 125000  # 125 KHz
-CODING_RATE = 5     # 4/5
-
-# --- SPI 통신 초기화 ---
-spi = spidev.SpiDev()
-spi.open(SPI_BUS, SPI_DEVICE)
-spi.max_speed_hz = 1000000 # 1MHz
-
-# --- GPIO 초기화 ---
-GPIO.setmode(GPIO.BCM)
-GPIO.setup(CS_PIN, GPIO.OUT)
-GPIO.setup(DIO0_PIN, GPIO.IN, GPIO.PUD_UP) # 풀업 저항 설정
-if RST_PIN is not None: # RST 핀이 설정된 경우에만 GPIO 설정
-    GPIO.setup(RST_PIN, GPIO.OUT)
-
-# --- SX127x LoRa 드라이버 초기화 ---
-lora = SX127x(spi, cs_pin=CS_PIN, dio0_pin=DIO0_PIN, rst_pin=RST_PIN)
-
-# --- LoRa 모듈 설정 함수 ---
-def setup_lora_receiver():
-    print("LoRa 수신 모듈 설정 중...")
+# Raspberry Pi CPU 온도 가져오기 함수 (수신기에서는 필요 없을 수 있으나, 원본 코드에 있었으므로 남겨둠)
+def get_cpu_temp():
     try:
-        lora.setup(
-            frequency=LORA_FREQUENCY,
-            spreading_factor=SPREADING_FACTOR,
-            bandwidth=BANDWIDTH,
-            coding_rate=CODING_RATE,
-            crc_enable=True # CRC 활성화로 데이터 무결성 검증
-        )
-        print(f"LoRa 수신 모듈 설정 완료: 주파수={LORA_FREQUENCY}MHz, SF={SPREADING_FACTOR}, BW={BANDWIDTH/1000}KHz")
-        lora.receive() # 수신 모드 진입
-        print("LoRa 패킷 수신 대기 중...")
-    except Exception as e:
-        print(f"LoRa 모듈 설정 오류: {e}")
-        GPIO.cleanup()
-        spi.close()
-        exit()
+        with open("/sys/class/thermal/thermal_zone0/temp", "r") as tempFile:
+            cpu_temp = tempFile.read()
+        return float(cpu_temp) / 1000
+    except FileNotFoundError:
+        return 0.0
 
-# --- 데이터 수신 콜백 함수 ---
-# DIO0 핀의 변화를 감지하여 호출되는 함수
-def on_lora_receive(channel):
-    global lora # lora 객체에 접근하기 위해 global 선언
-    if lora.has_received_packet(): # 수신된 패킷이 있는지 확인
-        try:
-            packet_data = lora.read_packet() # 패킷 데이터 읽기
-            
-            # 수신 강도 (RSSI) 및 신호 대 잡음비 (SNR) 가져오기
-            rssi = lora.get_last_rssi()
-            snr = lora.get_last_snr()
+# --- LoRa 모듈 초기화 ---
+# serial_num: Raspberry Pi Zero, Pi3B+, Pi4B는 일반적으로 "/dev/ttyS0" 사용
+# freq: 주파수 (410 ~ 493MHz 또는 850 ~ 930MHz 범위)
+# addr: 모듈 주소 (0 ~ 65535). 동일 주파수에서 통신하려면 주소가 같아야 합니다.
+#       단, 65535 주소는 브로드캐스트 주소로, 다른 모든 주소(0~65534)의 메시지를 수신할 수 있습니다.
+# power: 전송 출력 ({10, 13, 17, 22} dBm 중 선택) - 수신기에서는 전송을 하지 않으므로 중요하지 않음
+# rssi: 수신 시 RSSI 값 출력 여부 (True 또는 False)
+# air_speed: 공중 전송 속도 (bps). 송수신기 동일해야 함. (예: 2400bps)
+# relay: 릴레이 기능 활성화 여부 (True 또는 False)
+#
+# 주의: M0, M1 점퍼는 제거된 상태(HIGH)여야 합니다. (제조사 권장)
 
-            # 바이트 데이터를 문자열로 디코딩
-            received_message = packet_data.decode('utf-8')
-            current_time = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()) # UTC 시간
-
-            print(f"\n[{current_time}] Packet Received!")
-            print(f"  Data: '{received_message}'")
-            print(f"  RSSI: {rssi} dBm, SNR: {snr} dB")
-
-            # 다음 패킷 수신 대기 모드로 재전환 (중요!)
-            lora.receive() 
-        except Exception as e:
-            print(f"  Error processing received packet: {e}")
-            lora.receive() # 오류 발생 시에도 수신 대기 모드로 재전환 시도
-
+# 지상국(수신기) 설정 예시
+# 캔위성(송신기)과 동일한 주파수와 air_speed를 사용해야 합니다.
+# 수신기는 모든 주소의 메시지를 받기 위해 addr=65535 (브로드캐스트)로 설정하거나,
+# 송신기와 동일한 주소(addr=0)로 설정할 수 있습니다. 여기서는 캔위성과 동일하게 433MHz, addr=0으로 설정합니다.
+node = sx126x.sx126x(serial_num="/dev/ttyS0", freq=433, addr=0, power=22, rssi=True, air_speed=2400, relay=False)
 
 # --- 메인 루프 ---
 try:
-    setup_lora_receiver()
-    # DIO0 핀에 인터럽트 이벤트 감지 설정 (LoRa 모듈이 데이터 수신 시 알림)
-    # RISING 엣지에서 on_lora_receive 함수 호출
-    # bouncetime은 노이즈로 인한 중복 호출 방지
-    GPIO.add_event_detect(DIO0_PIN, GPIO.RISING, callback=on_lora_receive, bouncetime=200)
-
-    # 프로그램이 종료되지 않도록 무한 대기 (인터럽트 기반이므로 CPU 사용량 낮음)
+    time.sleep(1) # 모듈 초기화 대기
+    print("--------------------------------------------------")
+    print("LoRa 수신기 모드 시작. 메시지 수신 대기 중...")
+    print("종료하려면 Ctrl+C를 누르세요.")
+    print("--------------------------------------------------")
+    
     while True:
-        time.sleep(1) # 주기적으로 다른 작업 수행 가능 (여기서는 단순히 대기)
+        # LoRa 모듈로부터 메시지 수신
+        # sx126x 라이브러리의 receive() 함수가 메시지를 수신하고 처리합니다.
+        # 이 함수는 수신된 메시지를 내부적으로 처리하고,
+        # RSSI가 True로 설정되어 있으면 RSSI 값을 함께 출력합니다.
+        node.receive() 
+        
+        # CPU 사용률을 줄이기 위해 짧은 대기
+        time.sleep(0.1) 
 
 except KeyboardInterrupt:
-    print("\n수신 중단. LoRa 모듈 비활성화.")
+    print("\n프로그램 종료 요청.")
 except Exception as e:
-    print(f"예상치 못한 에러 발생: {e}")
+    print(f"\n예상치 못한 오류 발생: {e}")
 finally:
-    lora.sleep() # LoRa 모듈을 슬립 모드로 전환하여 전력 소모 줄임
-    spi.close()
-    GPIO.cleanup()
-    print("프로그램 종료.")
+    # 프로그램 종료 시 터미널 설정 복구
+    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+    print("\n프로그램이 종료되었습니다.")
+

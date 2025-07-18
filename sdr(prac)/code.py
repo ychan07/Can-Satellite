@@ -7,6 +7,7 @@ from scipy.fft import fft, fftshift
 from rtlsdr import RtlSdr
 import os # 파일 경로 및 디렉토리 관리를 위해 os 모듈 임포트
 
+<<<<<<< HEAD
 # LoRa 통신 모듈 임포트
 # 이 파일과 같은 디렉토리에 lora_comms.py와 sx126x.py가 있어야 합니다.
 from LoRa_module import LoRaComms 
@@ -16,6 +17,8 @@ from LoRa_module import LoRaComms
 # LoRaComms 객체를 생성합니다. 모든 LoRa 통신 파라미터는 lora_comms.py 내부에 고정되어 있습니다.
 lora_handler = LoRaComms()
 
+=======
+>>>>>>> a4d54c02ae7d8760bbf8bfaa488406fff722495e
 # --- SDR 설정 ---
 # 21cm 중성수소선 주파수 (Hz)
 CENTER_FREQ = 1420.405751e6 # 1420.405751 MHz
@@ -88,6 +91,7 @@ def capture_and_process_spectrum():
 
     return freqs, avg_spectrum
 
+<<<<<<< HEAD
 # --- 메인 실행 블록 ---
 try:
     print("SDR 관측 프로그램 시작.")
@@ -138,6 +142,48 @@ try:
     except Exception as e:
         print(f"그래프 저장 중 오류 발생: {e}")
 
+=======
+# --- 메인 실행 블록 (단일 측정) ---
+try:
+    start_time = time.time()
+    freqs, power_spectrum_db = capture_and_process_spectrum()
+    end_time = time.time()
+    
+    print(f"데이터 수집 및 처리 시간: {end_time - start_time:.2f} 초")
+
+    # --- 데이터 저장 ---
+    timestamp = time.strftime("%Y%m%d_%H%M%S", time.gmtime()) # UTC 시간 사용 권장
+    
+    # 1. CSV 파일로 스펙트럼 데이터 저장
+    csv_filename = os.path.join(DATA_SAVE_DIR, f"spectrum_data_{timestamp}.csv")
+    np.savetxt(csv_filename, np.column_stack([freqs, power_spectrum_db]), 
+               delimiter=',', header='Frequency_Hz,Power_dB', comments='')
+    print(f"스펙트럼 데이터 '{csv_filename}'에 저장 완료.")
+
+    
+    try:
+        import matplotlib.pyplot as plt
+        png_filename = os.path.join(DATA_SAVE_DIR, f"spectrum_plot_{timestamp}.png")
+        plt.figure(figsize=(12, 6))
+        plt.plot(freqs / 1e6, power_spectrum_db) # 주파수를 MHz 단위로 표시
+        plt.title(f'Average Power Spectrum @ {CENTER_FREQ/1e6:.3f} MHz (Avg: {NUM_AVERAGES})')
+        plt.xlabel('Frequency (MHz)')
+        plt.ylabel('Power (dB)')
+        plt.grid(True)
+        # 21cm 라인 주변에 마커 표시 (도플러 효과 고려하여 범위 지정)
+        plt.axvline(CENTER_FREQ/1e6, color='r', linestyle='--', label='21cm Hydrogen Line (Ideal)')
+        plt.axvspan((CENTER_FREQ-200e3)/1e6, (CENTER_FREQ+200e3)/1e6, color='yellow', alpha=0.3, label='Expected Doppler Range') # 예시 범위
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(png_filename)
+        plt.close() # 플롯 창 닫기 (메모리 관리)
+        print(f"스펙트럼 플롯 '{png_filename}' 저장 완료.")
+    except ImportError:
+        print("matplotlib이 설치되지 않아 그래프를 저장할 수 없습니다. 'pip3 install matplotlib'로 설치해주세요.")
+    except Exception as e:
+        print(f"그래프 저장 중 오류 발생: {e}")
+
+>>>>>>> a4d54c02ae7d8760bbf8bfaa488406fff722495e
     print("-" * 30)
 
 except Exception as e:
