@@ -106,11 +106,18 @@ try:
     # --- 데이터 저장 ---
     timestamp = time.strftime("%Y%m%d_%H%M%S", time.gmtime()) # UTC 시간 사용 권장
     
-    # 1. CSV 파일로 스펙트럼 데이터 저장
+    # toolbox.py의 axishifter.py와 호환되도록 데이터 형식 변경
+    # 1. 주파수를 Hz에서 MHz로 변환
+    freqs_mhz = freqs / 1e6
+
+    # 2. axishifter가 요구하는 세 번째 열 (pre_baseline_intensity) 추가 (더미 값 0 사용)
+    dummy_col = np.zeros_like(power_spectrum_db)
+
+    # 3. 데이터를 파일로 저장 (공백으로 분리, 헤더 없음)
     csv_filename = os.path.join(DATA_SAVE_DIR, f"spectrum_data_{timestamp}.csv")
-    np.savetxt(csv_filename, np.column_stack([freqs, power_spectrum_db]), 
-               delimiter=',', header='Frequency_Hz,Power_dB', comments='')
-    print(f"스펙트럼 데이터 '{csv_filename}'에 저장 완료.")
+    np.savetxt(csv_filename, np.column_stack([freqs_mhz, power_spectrum_db, dummy_col]),
+               delimiter=' ', header='', comments='') # 공백으로 분리, 헤더 없음
+    print(f"스펙트럼 데이터 '{csv_filename}'에 저장 완료 (toolbox 호환 형식).")
 
     # SDR 관측 완료 메시지 LoRa 전송
     if lora_handler.node:
