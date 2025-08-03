@@ -1,149 +1,268 @@
-import time
-import subprocess
-import sys
+
+
 import os
-import threading
+import time
 from collections import deque
-
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
-from LoRa.LoRa_module import LoRaComms
+import numpy as np
+from scipy.fft import fft, fftshift
+from rtlsdr import RtlSdr
 import board
 import busio
 import adafruit_bmp280
 
-# --- Configuration ---
-DESCENT_THRESHOLD = 3  # 낙하 감지 고도 변화량 (미터)
-LANDING_TIME_WINDOW = 5  # 착지 감지를 위한 시간 (초)
-LANDING_ALTITUDE_THRESHOLD = 0.5  # 착지 감지를 위한 고도 변화량 (미터)
-ALTITUDE_READ_INTERVAL = 1  # 고도 측정 간격 (초)
+# LoRa 모듈 임포트 (LoRa 폴더에 접근 가능해야 함)
+# 이 스크립트를 프로젝트 루트에서 실행한다고 가정합니다.
+from LoRa.LoRa_module import LoRaComms
 
-lora_handler = None
-sdr_process = None
-stop_sdr_event = threading.Event()
+# --- 설정 (Configuration) ---
 
-def print_and_lora_send(message):
-    """Prints a message to the console and sends it via LoRa."""
-    print(message)
-    if lora_handler and lora_handler.node:
-        lora_handler.send_message(message)
+# 상태 감지 설정 (State Detection Configuration)
+LOOP_INTERVAL_S = 0.5        # 메인 루프 주기 (초)
+MOVING_AVG_SIZE = 5          # 이동 평균을 계산할 샘플 개수
+ASCENT_SPEED_THRESHOLD = 0.5   # 상승으로 판단할 최소 수직 속도 (m/s)
+DESCENT_SPEED_THRESHOLD = -0.5 # 하강으로 판단할 최소 수직 속도 (m/s)
+ASCENT_CONFIRMATION_COUNT = 5  # 상승 상태를 확정하기 위한 연속 만족 횟수
+DESCENT_CONFIRMATION_COUNT = 3 # 하강 상태를 확정하기 위한 연속 만족 횟수
 
-def get_altitude():
-    """BMP280 센서로부터 현재 고도를 읽어옵니다."""
+# SDR 설정
+SDR_CENTER_FREQ = 1420.405751e6  # 21cm 중성수소선 주파수 (Hz)
+SDR_SAMPLE_RATE = 2.048e6        # 샘플링 속도 (SPS)
+SDR_NUM_SAMPLES = 2**16          # FFT를 위한 샘플 개수
+SDR_GAIN = 15                    # SDR 수신 게인 (dB)
+
+# 데이터 저장 설정
+DATA_BASE_DIR = "Cansat_data"
+OBSERVATION_DIR = os.path.join(DATA_BASE_DIR, "observation")
+
+# --- 초기화 (Initialization) ---
+
+def initialize_lora():
+    """LoRa 통신 모듈을 초기화하고 핸들러를 반환합니다."""
     try:
-        return bmp280.altitude
+        lora_handler = LoRaComms()
+        if lora_handler.node:
+            print("LoRa module initialized successfully.")
+            lora_handler.send_message("INFO: LoRa module ready.")
+            return lora_handler
+        else:
+            print("Warning: LoRa module initialization failed.")
+            return None
     except Exception as e:
-        print_and_lora_send(f"Error: Failed to read altitude: {e}")
+        print(f"Error initializing LoRa: {e}")
         return None
 
-def run_sdr_measurement_thread():
-    """SDR 측정을 별도의 스레드에서 실행합니다."""
-    global sdr_process
-    sdr_script_path = os.path.join(os.path.dirname(__file__), 'sdr(prac)', 'code.py')
-    sdr_working_dir = os.path.join(os.path.dirname(__file__), 'sdr(prac)')
-
-    if not os.path.exists(sdr_script_path):
-        print_and_lora_send(f"Error: SDR script not found: {sdr_script_path}")
-        return
-
-    print_and_lora_send(f"Starting SDR measurement script: {sdr_script_path}")
+def initialize_sdr():
+    """RTL-SDR을 초기화하고 객체를 반환합니다."""
     try:
-        # Popen을 사용하여 비동기적으로 실행하고, stop_sdr_event를 감시
-        sdr_process = subprocess.Popen(['python', sdr_script_path], cwd=sdr_working_dir)
-        
-        # stop_sdr_event가 설정될 때까지 대기
-        stop_sdr_event.wait()
-
-        # 이벤트가 설정되면 SDR 프로세스 종료
-        print_and_lora_send("Stopping SDR measurement...")
-        sdr_process.terminate()
-        sdr_process.wait() # 프로세스가 완전히 종료될 때까지 대기
-        print_and_lora_send("SDR measurement stopped.")
-
-    except subprocess.CalledProcessError as e:
-        print_and_lora_send(f"Error: SDR measurement script failed: {e}")
-    except FileNotFoundError:
-        print_and_lora_send("Error: 'python' command not found. Make sure Python is installed and in your PATH.")
+        sdr = RtlSdr()
+        sdr.sample_rate = SDR_SAMPLE_RATE
+        sdr.center_freq = SDR_CENTER_FREQ
+        sdr.gain = SDR_GAIN
+        print(f"SDR initialized: Freq={sdr.center_freq/1e6:.2f}MHz, Rate={sdr.sample_rate/1e6:.2f}MSps, Gain={sdr.gain}dB")
+        return sdr
     except Exception as e:
-        print_and_lora_send(f"An unexpected error occurred in SDR thread: {e}")
+        print(f"Error initializing SDR: {e}")
+        return None
 
-
-def main():
-    global lora_handler
-    print_and_lora_send("--- Can-Satellite Autonomous Pipeline ---")
-
-    # --- Initialize LoRa ---
-    lora_handler = LoRaComms()
-    if not lora_handler.node:
-        print_and_lora_send("Warning: LoRa module initialization failed.")
-
-    # --- Initialize BMP280 Sensor ---
+def initialize_sensor():
+    """BMP280 고도 센서를 초기화하고 객체를 반환합니다."""
     try:
         i2c = busio.I2C(board.SCL, board.SDA)
-        global bmp280
         bmp280 = adafruit_bmp280.Adafruit_BMP280_I2C(i2c, address=0x76)
+        # 중요: 정확한 고도 측정을 위해 현장의 해수면 기압으로 보정해야 합니다.
         bmp280.sea_level_pressure = 1013.25
-        print_and_lora_send("BMP280 altitude sensor initialized.")
+        print("BMP280 altitude sensor initialized.")
+        return bmp280
     except Exception as e:
-        print_and_lora_send(f"Error: Could not initialize BMP280 sensor: {e}")
-        sys.exit(1)
+        print(f"Error initializing BMP280 sensor: {e}")
+        return None
 
-    # --- Wait for Descent ---
-    print_and_lora_send("Waiting for descent...")
-    last_altitude = get_altitude()
-    if last_altitude is None:
-        print_and_lora_send("Could not get initial altitude. Exiting.")
+# --- 핵심 기능 (Core Functions) ---
+
+def get_altitude(sensor):
+    """센서로부터 현재 고도를 읽어 반환합니다."""
+    try:
+        return sensor.altitude
+    except Exception as e:
+        print(f"Warning: Failed to read altitude - {e}")
+        return None # 오류 발생 시 None 반환
+
+def capture_and_save_spectrum(sdr, save_dir):
+    """
+    SDR에서 데이터를 캡처하고, 스펙트럼을 계산한 후,
+    toolbox.py와 호환되는 형식으로 파일에 저장합니다.
+    """
+    try:
+        # 1. I/Q 데이터 수집
+        samples = sdr.read_samples(SDR_NUM_SAMPLES)
+
+        # 2. FFT 및 파워 스펙트럼 계산
+        spectrum = fftshift(fft(samples))
+        power_spectrum_db = 10 * np.log10(np.abs(spectrum)**2 + 1e-12)
+
+        # 3. 주파수 축 생성 및 MHz로 변환
+        freqs = np.fft.fftfreq(SDR_NUM_SAMPLES, d=1/SDR_SAMPLE_RATE)
+        freqs_mhz = (fftshift(freqs) + SDR_CENTER_FREQ) / 1e6
+
+        # 4. toolbox 호환을 위한 더미 열 추가
+        dummy_col = np.zeros_like(power_spectrum_db)
+
+        # 5. 타임스탬프 파일명으로 저장 (공백 분리, 헤더 없음)
+        timestamp = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
+        filename = os.path.join(save_dir, f"{timestamp}.csv")
+        
+        np.savetxt(filename, np.column_stack([freqs_mhz, power_spectrum_db, dummy_col]),
+                   delimiter=' ', header='', comments='')
+        
+        return os.path.basename(filename)
+
+    except Exception as e:
+        print(f"Error during spectrum capture/save: {e}")
+        return None
+
+# --- 메인 파이프라인 (Main Pipeline) ---
+
+def main():
+    """메인 자동 관측 파이프라인을 실행합니다."""
+    
+    # 디렉토리 생성
+    if not os.path.exists(OBSERVATION_DIR):
+        os.makedirs(OBSERVATION_DIR)
+        print(f"Created data directory: {OBSERVATION_DIR}")
+
+    # 1. 모듈 초기화
+    lora = initialize_lora()
+    sdr = initialize_sdr()
+    sensor = initialize_sensor()
+
+    if not all([lora, sdr, sensor]):
+        error_msg = "FATAL: Initialization failed. Check connections and permissions."
+        print(error_msg)
+        if lora: lora.send_message(error_msg)
         return
 
-    while True:
-        time.sleep(ALTITUDE_READ_INTERVAL)
-        current_altitude = get_altitude()
-        if current_altitude is None:
-            continue
-
-        altitude_change = last_altitude - current_altitude
-        print(f"Current Alt: {current_altitude:.2f}m, Change: {altitude_change:.2f}m")
-
-        if altitude_change > DESCENT_THRESHOLD:
-            print_and_lora_send(f"Descent detected! (Drop: {altitude_change:.2f}m)")
-            break
-        
-        # 낙하하지 않았으면 현재 고도를 이전 고도로 업데이트
-        if current_altitude < last_altitude:
-            last_altitude = current_altitude
-
-
-    # --- Start SDR Measurement ---
-    sdr_thread = threading.Thread(target=run_sdr_measurement_thread)
-    sdr_thread.start()
-    print_and_lora_send("SDR measurement started in background.")
-
-    # --- Wait for Landing ---
-    print_and_lora_send("Monitoring for landing...")
-    altitude_history = deque(maxlen=LANDING_TIME_WINDOW)
+    # --- 고급 상태 감지 로직 초기화 ---
+    altitude_window = deque(maxlen=MOVING_AVG_SIZE)
+    velocity_window = deque(maxlen=MOVING_AVG_SIZE)
     
-    while sdr_thread.is_alive():
-        current_altitude = get_altitude()
-        if current_altitude is not None:
-            altitude_history.append(current_altitude)
+    # 초기 고도 안정화 (필터 예열)
+    print("Calibrating initial altitude...")
+    try:
+        initial_readings = [sensor.altitude for _ in range(MOVING_AVG_SIZE)]
+        altitude_window.extend(initial_readings)
+    except Exception as e:
+        error_msg = f"FATAL: Could not get initial altitude. Error: {e}"
+        print(error_msg)
+        if lora: lora.send_message(error_msg)
+        return
 
-            if len(altitude_history) == LANDING_TIME_WINDOW:
-                altitude_variation = max(altitude_history) - min(altitude_history)
-                print(f"Altitude variation in last {LANDING_TIME_WINDOW}s: {altitude_variation:.2f}m")
+    last_altitude_smoothed = np.mean(altitude_window)
+    last_time = time.monotonic()
+    print(f"Initial altitude calibrated to: {last_altitude_smoothed:.2f}m")
 
-                if altitude_variation < LANDING_ALTITUDE_THRESHOLD:
-                    print_and_lora_send(f"Landing detected! (Variation: {altitude_variation:.2f}m)")
-                    stop_sdr_event.set() # SDR 중지 신호 전송
-                    break
-        
-        time.sleep(1)
+    # 상태 변수 초기화
+    state = "GROUND"
+    ascent_counter = 0
+    descent_counter = 0
+    last_lora_time = 0
 
-    # --- Finalization ---
-    sdr_thread.join() # SDR 스레드가 완전히 종료될 때까지 대기
-    if lora_handler and lora_handler.node:
-        lora_handler.cleanup()
-    print_and_lora_send("Pipeline finished.")
+    if lora:
+        lora.send_message(f"INFO: Pipeline ready. State: GROUND. Alt: {last_altitude_smoothed:.1f}m")
 
+    # 첫 루프의 시간 간격(time_delta)을 정확히 하기 위해 한번 기다림
+    time.sleep(LOOP_INTERVAL_S)
+
+    try:
+        while True:
+            current_time = time.monotonic()
+            
+            # 1. 고도 및 속도 계산
+            try:
+                raw_altitude = sensor.altitude
+            except Exception as e:
+                print(f"Warning: Failed to read altitude - {e}")
+                time.sleep(LOOP_INTERVAL_S)
+                continue
+
+            altitude_window.append(raw_altitude)
+            smoothed_altitude = np.mean(altitude_window)
+            
+            time_delta = current_time - last_time
+            vertical_velocity = (smoothed_altitude - last_altitude_smoothed) / time_delta if time_delta > 0 else 0
+            velocity_window.append(vertical_velocity)
+            smoothed_velocity = np.mean(velocity_window)
+
+            # 2. 상태 머신 (State Machine)
+            if state == "GROUND":
+                if smoothed_velocity > ASCENT_SPEED_THRESHOLD:
+                    ascent_counter += 1
+                    if ascent_counter >= ASCENT_CONFIRMATION_COUNT:
+                        state = "ASCENDING"
+                        msg = f"STATE_CHANGE: Ascent detected. Now ASCENDING. Alt: {smoothed_altitude:.1f}m, Vel: {smoothed_velocity:+.1f}m/s"
+                        print(msg)
+                        if lora: lora.send_message(msg)
+                        # 상태 전환 시 반대편 카운터는 확실히 리셋
+                        descent_counter = 0 
+                else:
+                    # 상승 조건이 아닐 때는 항상 리셋
+                    ascent_counter = 0
+
+            elif state == "ASCENDING":
+                if smoothed_velocity < DESCENT_SPEED_THRESHOLD:
+                    descent_counter += 1
+                    if descent_counter >= DESCENT_CONFIRMATION_COUNT:
+                        state = "OBSERVING"
+                        msg = f"STATE_CHANGE: Descent detected. Now OBSERVING. Alt: {smoothed_altitude:.1f}m, Vel: {smoothed_velocity:+.1f}m/s"
+                        print(msg)
+                        if lora: lora.send_message(msg)
+                        ascent_counter = 0
+                else:
+                    descent_counter = 0
+
+            elif state == "OBSERVING":
+                # 관측 상태에서는 스펙트럼 캡처 및 저장
+                filename = capture_and_save_spectrum(sdr, OBSERVATION_DIR)
+                if filename:
+                    # 관측 성공 메시지는 2초마다 전송 (너무 자주 보내지 않도록)
+                    if time.time() - last_lora_time > 2:
+                        msg = f"OBS: Alt: {smoothed_altitude:.1f}m, Vel: {smoothed_velocity:+.1f}m/s. Saved {filename}"
+                        print(msg)
+                        if lora: lora.send_message(msg)
+                        last_lora_time = time.time()
+                else:
+                    msg = f"ERROR: Failed to save spectrum data. Alt: {smoothed_altitude:.1f}m"
+                    print(msg)
+                    if lora: lora.send_message(msg)
+            
+            # 주기적인 상태 보고 (2초마다)
+            if time.time() - last_lora_time > 2 and state != "OBSERVING":
+                msg = f"STATUS: {state}. Alt: {smoothed_altitude:.1f}m, Vel: {smoothed_velocity:+.1f}m/s, Cnt(A/D):{ascent_counter}/{descent_counter}"
+                print(msg)
+                if lora: lora.send_message(msg)
+                last_lora_time = time.time()
+
+            # 현재 상태를 다음 루프를 위해 저장
+            last_altitude_smoothed = smoothed_altitude
+            last_time = current_time
+
+            time.sleep(LOOP_INTERVAL_S)
+
+    except KeyboardInterrupt:
+        print("\nPipeline stopped by user.")
+        if lora:
+            lora.send_message("INFO: Pipeline stopped by user.")
+    except Exception as e:
+        error_msg = f"FATAL_ERROR: {e}"
+        print(error_msg)
+        if lora:
+            lora.send_message(error_msg)
+    finally:
+        # 자원 정리
+        if sdr:
+            sdr.close()
+        if lora and lora.node:
+            lora.cleanup()
+        print("Resources cleaned up. Exiting.")
 
 if __name__ == "__main__":
     main()
